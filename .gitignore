@@ -1,0 +1,47 @@
+# Go binary
+go-flux
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Go test binary
+*.test
+
+# Go coverage
+*.out
+
+# Vendor (optional)
+# vendor/
+
+# Environment variables
+.env
+.env.local
+.env.*
+
+# Frontend build outputs
+frontend/dist/
+frontend/node_modules/
+
+# Editor directories
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Testing
+coverage/
+test-results/
+
+# Temporary files
+*.tmp
+.cache/
+
+# Local Deepgram working directory
+.deepgram/
