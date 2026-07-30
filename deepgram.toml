@@ -6,7 +6,7 @@ repository = "https://github.com/deepgram-starters/go-flux"
 useCase = "flux"
 language = "go"
 framework = "go"
-sdk = "N/A"
+sdk = "deepgram-go-sdk"
 tags = ["flux", "turn-detection", "real-time-transcription", "streaming-stt", "end-of-turn", "go"]
 
 [check]

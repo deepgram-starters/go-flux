@@ -21,13 +21,18 @@ import (
 	"fmt"
 	"log"
 	"net/http"
-	"net/url"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
+
+	fluxmsg "github.com/deepgram/deepgram-go-sdk/v3/pkg/api/listen/v2/websocket/interfaces"
+	dginterfaces "github.com/deepgram/deepgram-go-sdk/v3/pkg/client/interfaces"
+	listen "github.com/deepgram/deepgram-go-sdk/v3/pkg/client/listen"
+	listenv2 "github.com/deepgram/deepgram-go-sdk/v3/pkg/client/listen/v2"
 
 	"github.com/BurntSushi/toml"
 	"github.com/golang-jwt/jwt/v5"
@@ -150,6 +155,56 @@ var upgrader = websocket.Upgrader{
 // activeConnections tracks all active client WebSocket connections for graceful shutdown.
 var activeConnections sync.Map
 
+// fluxCallback implements the Deepgram SDK FluxMessageCallback interface and
+// relays Flux (listen v2) events to the browser WebSocket as JSON text frames,
+// preserving the wire format the frontend already expects.
+type fluxCallback struct {
+	conn *websocket.Conn
+	mu   *sync.Mutex
+}
+
+// send marshals a Deepgram response and writes it to the browser connection.
+func (c *fluxCallback) send(v interface{}) {
+	data, err := json.Marshal(v)
+	if err != nil {
+		log.Printf("Failed to marshal Flux event: %v", err)
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if err := c.conn.WriteMessage(websocket.TextMessage, data); err != nil {
+		log.Printf("Failed to forward Flux event to client: %v", err)
+	}
+}
+
+func (c *fluxCallback) Open(or *fluxmsg.OpenResponse) error { return nil }
+func (c *fluxCallback) Connected(cr *fluxmsg.ConnectedResponse) error {
+	c.send(cr)
+	return nil
+}
+func (c *fluxCallback) TurnInfo(tr *fluxmsg.TurnInfoResponse) error {
+	c.send(tr)
+	return nil
+}
+func (c *fluxCallback) ConfigureSuccess(cs *fluxmsg.ConfigureSuccessResponse) error {
+	c.send(cs)
+	return nil
+}
+func (c *fluxCallback) ConfigureFailure(cf *fluxmsg.ConfigureFailureResponse) error {
+	c.send(cf)
+	return nil
+}
+func (c *fluxCallback) FatalError(fe *fluxmsg.FatalErrorResponse) error {
+	c.send(fe)
+	return nil
+}
+func (c *fluxCallback) Close(cr *fluxmsg.CloseResponse) error { return nil }
+func (c *fluxCallback) Error(er *fluxmsg.ErrorResponse) error {
+	c.send(er)
+	return nil
+}
+func (c *fluxCallback) UnhandledEvent(byData []byte) error { return nil }
+
 // handleFluxProxy proxies WebSocket messages between the client and Deepgram's Flux API.
 func handleFluxProxy(cfg Config) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -192,119 +247,90 @@ func handleFluxProxy(cfg Config) http.HandlerFunc {
 		eotTimeoutMs := query.Get("eot_timeout_ms")
 		keyterms := query["keyterm"] // Multi-value support
 
-		// Build Deepgram WebSocket URL with query parameters
-		deepgramURL, _ := url.Parse(cfg.DeepgramSTTURL)
-		q := deepgramURL.Query()
-		q.Set("model", model)
-		q.Set("encoding", encoding)
-		q.Set("sample_rate", sampleRate)
+		// Build Flux transcription options from the forwarded query params.
+		tOptions := &dginterfaces.FluxTranscriptionOptions{
+			Model:    model,
+			Encoding: encoding,
+			Keyterm:  keyterms, // multi-value support
+		}
+		if sr, err := strconv.Atoi(sampleRate); err == nil {
+			tOptions.SampleRate = sr
+		}
 		if eotThreshold != "" {
-			q.Set("eot_threshold", eotThreshold)
+			if v, err := strconv.ParseFloat(eotThreshold, 64); err == nil {
+				tOptions.EotThreshold = v
+			}
 		}
 		if eagerEotThreshold != "" {
-			q.Set("eager_eot_threshold", eagerEotThreshold)
+			if v, err := strconv.ParseFloat(eagerEotThreshold, 64); err == nil {
+				tOptions.EagerEotThreshold = v
+			}
 		}
 		if eotTimeoutMs != "" {
-			q.Set("eot_timeout_ms", eotTimeoutMs)
+			if v, err := strconv.Atoi(eotTimeoutMs); err == nil {
+				tOptions.EotTimeoutMs = v
+			}
 		}
-		for _, term := range keyterms {
-			q.Add("keyterm", term)
-		}
-		deepgramURL.RawQuery = q.Encode()
 
 		log.Printf("Connecting to Deepgram Flux: model=%s, encoding=%s, sample_rate=%s", model, encoding, sampleRate)
-		log.Printf("Deepgram URL: %s", deepgramURL.String())
 
-		// Create WebSocket connection to Deepgram
-		dialer := websocket.DefaultDialer
-		dgHeader := http.Header{}
-		dgHeader.Set("Authorization", "Token "+cfg.DeepgramAPIKey)
+		// Serialize all writes to the browser connection (callback + close frames).
+		writeMu := &sync.Mutex{}
+		closeToClient := func(code int, msg string) {
+			writeMu.Lock()
+			defer writeMu.Unlock()
+			clientConn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(code, msg))
+		}
 
-		deepgramConn, resp, err := dialer.Dial(deepgramURL.String(), dgHeader)
+		// Connect to Deepgram Flux using the official Go SDK (listen v2 WebSocket).
+		cOptions := &dginterfaces.ClientOptionsV2{EnableKeepAlive: true}
+		callback := &fluxCallback{conn: clientConn, mu: writeMu}
+
+		dgClient, err := listenv2.NewWSUsingCallback(context.Background(), cfg.DeepgramAPIKey, cOptions, tOptions, callback)
 		if err != nil {
-			if resp != nil {
-				log.Printf("Deepgram rejected connection (%d)", resp.StatusCode)
-			} else {
-				log.Printf("Deepgram connection failed: %v", err)
-			}
-			clientConn.WriteMessage(websocket.CloseMessage,
-				websocket.FormatCloseMessage(websocket.CloseInternalServerErr, "Deepgram connection failed"))
+			log.Printf("Failed to create Deepgram Flux client: %v", err)
+			closeToClient(websocket.CloseInternalServerErr, "Deepgram connection failed")
 			return
 		}
-		defer deepgramConn.Close()
+
+		if !dgClient.Connect() {
+			log.Printf("Deepgram Flux connection failed")
+			closeToClient(websocket.CloseInternalServerErr, "Deepgram connection failed")
+			return
+		}
+		defer dgClient.Stop()
 
 		log.Println("Connected to Deepgram Flux API")
 
-		// done channel to coordinate goroutine shutdown
-		done := make(chan struct{})
-		var once sync.Once
-		closeDone := func() { once.Do(func() { close(done) }) }
+		// Pump audio (binary) and control (text) messages from the browser to Deepgram.
+		for {
+			msgType, data, err := clientConn.ReadMessage()
+			if err != nil {
+				if websocket.IsUnexpectedCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
+					log.Printf("Client read error: %v", err)
+				} else {
+					log.Printf("Client disconnected")
+				}
+				break
+			}
 
-		clientMessageCount := 0
-		deepgramMessageCount := 0
-
-		// Forward Deepgram messages to client
-		go func() {
-			defer closeDone()
-			for {
-				msgType, data, err := deepgramConn.ReadMessage()
-				if err != nil {
-					if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
-						log.Printf("Deepgram connection closed normally")
-					} else {
-						log.Printf("Deepgram read error: %v", err)
-					}
-					// Forward close to client
-					clientConn.WriteMessage(websocket.CloseMessage,
-						websocket.FormatCloseMessage(websocket.CloseNormalClosure, "Deepgram disconnected"))
+			switch msgType {
+			case websocket.BinaryMessage:
+				if _, werr := dgClient.Write(data); werr != nil {
+					log.Printf("Error writing audio to Deepgram: %v", werr)
+					closeToClient(websocket.CloseInternalServerErr, "Deepgram write failed")
 					return
 				}
-
-				deepgramMessageCount++
-				isBinary := msgType == websocket.BinaryMessage
-				if deepgramMessageCount%10 == 0 || !isBinary {
-					log.Printf("<- Deepgram message #%d (binary: %v, size: %d)", deepgramMessageCount, isBinary, len(data))
-				}
-
-				if err := clientConn.WriteMessage(msgType, data); err != nil {
-					log.Printf("Error forwarding to client: %v", err)
+			case websocket.TextMessage:
+				// A CloseStream control message from the browser ends the session.
+				if strings.Contains(string(data), "CloseStream") {
+					log.Println("Received CloseStream from client")
+					closeToClient(websocket.CloseNormalClosure, "")
 					return
 				}
 			}
-		}()
+		}
 
-		// Forward client messages to Deepgram
-		go func() {
-			defer closeDone()
-			for {
-				msgType, data, err := clientConn.ReadMessage()
-				if err != nil {
-					if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
-						log.Printf("Client disconnected normally")
-					} else {
-						log.Printf("Client read error: %v", err)
-					}
-					// Forward close to Deepgram
-					deepgramConn.WriteMessage(websocket.CloseMessage,
-						websocket.FormatCloseMessage(websocket.CloseNormalClosure, "Client disconnected"))
-					return
-				}
-
-				clientMessageCount++
-				isBinary := msgType == websocket.BinaryMessage
-				if clientMessageCount%100 == 0 || !isBinary {
-					log.Printf("-> Client message #%d (binary: %v, size: %d)", clientMessageCount, isBinary, len(data))
-				}
-
-				if err := deepgramConn.WriteMessage(msgType, data); err != nil {
-					log.Printf("Error forwarding to Deepgram: %v", err)
-					return
-				}
-			}
-		}()
-
-		// Wait for either goroutine to finish
-		<-done
 		log.Println("WebSocket proxy session ended")
 	}
 }
@@ -369,6 +395,9 @@ func corsMiddleware(next http.Handler) http.Handler {
 
 func main() {
 	cfg := loadConfig()
+
+	// Initialize the Deepgram Go SDK.
+	listen.InitWithDefault()
 
 	mux := http.NewServeMux()
 
