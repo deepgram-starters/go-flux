@@ -1,8 +1,11 @@
 /**
  * Go Flux Starter - Backend Server
  *
- * Simple WebSocket proxy to Deepgram's Flux API.
- * Forwards all messages (JSON and binary) bidirectionally between client and Deepgram.
+ * WebSocket bridge to Deepgram's Flux API via the official Go SDK (listen v2).
+ * Deepgram events are received through the SDK callback and re-marshaled to the
+ * browser as JSON; client audio (binary) is written to the SDK, and client text
+ * control frames (CloseStream, Configure, ...) are forwarded to Deepgram. On a
+ * Deepgram-side close/fatal, the browser session is torn down.
  *
  * Routes:
  *   GET  /api/session              - Issue JWT session token
@@ -26,6 +29,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -161,6 +165,15 @@ var activeConnections sync.Map
 type fluxCallback struct {
 	conn *websocket.Conn
 	mu   *sync.Mutex
+	// teardown closes the browser connection (sending a close frame) so a
+	// Deepgram-initiated close/fatal propagates to the client and unblocks the
+	// handler's read loop. Safe to call multiple times.
+	teardown func(code int, reason string)
+	// closing is set once an intentional shutdown is under way (client
+	// CloseStream or teardown). While set, the transport-close "error" the SDK
+	// synthesizes from Deepgram's socket close is not forwarded to the browser
+	// as a spurious Error frame.
+	closing *atomic.Bool
 }
 
 // send marshals a Deepgram response and writes it to the browser connection.
@@ -196,10 +209,23 @@ func (c *fluxCallback) ConfigureFailure(cf *fluxmsg.ConfigureFailureResponse) er
 }
 func (c *fluxCallback) FatalError(fe *fluxmsg.FatalErrorResponse) error {
 	c.send(fe)
+	// A fatal error ends the Deepgram session; tear down the browser too.
+	c.teardown(websocket.CloseInternalServerErr, "Deepgram fatal error")
 	return nil
 }
-func (c *fluxCallback) Close(cr *fluxmsg.CloseResponse) error { return nil }
+func (c *fluxCallback) Close(cr *fluxmsg.CloseResponse) error {
+	// Deepgram closed the connection; close the browser session so the read
+	// loop returns instead of blocking until the browser happens to disconnect.
+	c.teardown(websocket.CloseNormalClosure, "")
+	return nil
+}
 func (c *fluxCallback) Error(er *fluxmsg.ErrorResponse) error {
+	// During an intentional shutdown the SDK reports Deepgram's socket close as
+	// an error; don't forward that as a data frame — the session is already
+	// ending. A real mid-session error (closing not set) is still surfaced.
+	if c.closing.Load() {
+		return nil
+	}
 	c.send(er)
 	return nil
 }
@@ -282,9 +308,25 @@ func handleFluxProxy(cfg Config) http.HandlerFunc {
 			clientConn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(code, msg))
 		}
 
+		// teardown tears down the browser session exactly once: send a close
+		// frame, close the connection (which unblocks clientConn.ReadMessage in
+		// the pump below), and signal `done`. Invoked either by the SDK callback
+		// (Deepgram close/fatal) or after a client CloseStream is drained.
+		done := make(chan struct{})
+		closing := &atomic.Bool{}
+		var closeOnce sync.Once
+		teardown := func(code int, reason string) {
+			closeOnce.Do(func() {
+				closing.Store(true)
+				closeToClient(code, reason)
+				clientConn.Close()
+				close(done)
+			})
+		}
+
 		// Connect to Deepgram Flux using the official Go SDK (listen v2 WebSocket).
 		cOptions := &dginterfaces.ClientOptionsV2{EnableKeepAlive: true}
-		callback := &fluxCallback{conn: clientConn, mu: writeMu}
+		callback := &fluxCallback{conn: clientConn, mu: writeMu, teardown: teardown, closing: closing}
 
 		dgClient, err := listenv2.NewWSUsingCallback(context.Background(), cfg.DeepgramAPIKey, cOptions, tOptions, callback)
 		if err != nil {
@@ -318,15 +360,34 @@ func handleFluxProxy(cfg Config) http.HandlerFunc {
 			case websocket.BinaryMessage:
 				if _, werr := dgClient.Write(data); werr != nil {
 					log.Printf("Error writing audio to Deepgram: %v", werr)
-					closeToClient(websocket.CloseInternalServerErr, "Deepgram write failed")
+					teardown(websocket.CloseInternalServerErr, "Deepgram write failed")
 					return
 				}
 			case websocket.TextMessage:
 				// A CloseStream control message from the browser ends the session.
+				// Forward it to Deepgram and wait for the server to flush its
+				// final turn(s) — delivered to the browser via the callback —
+				// before tearing down, rather than closing immediately and
+				// racing the last finalized transcript. The Close callback fires
+				// teardown; a bounded timeout guards against a missing close.
 				if strings.Contains(string(data), "CloseStream") {
 					log.Println("Received CloseStream from client")
-					closeToClient(websocket.CloseNormalClosure, "")
+					closing.Store(true)
+					if werr := dgClient.WriteJSON(json.RawMessage(data)); werr != nil {
+						log.Printf("Error forwarding CloseStream to Deepgram: %v", werr)
+					}
+					select {
+					case <-done:
+					case <-time.After(5 * time.Second):
+						log.Println("Timed out waiting for Deepgram to finalize after CloseStream")
+					}
 					return
+				}
+				// Forward any other client control frame (e.g. a Flux Configure
+				// update to thresholds/keyterms) to Deepgram verbatim instead of
+				// silently dropping it.
+				if werr := dgClient.WriteJSON(json.RawMessage(data)); werr != nil {
+					log.Printf("Error forwarding client control message to Deepgram: %v", werr)
 				}
 			}
 		}
