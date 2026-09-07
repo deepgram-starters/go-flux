@@ -226,7 +226,19 @@ func (c *fluxCallback) Error(er *fluxmsg.ErrorResponse) error {
 	if c.closing.Load() {
 		return nil
 	}
-	c.send(er)
+	// Hand-build the frame instead of marshaling the SDK struct. ErrorResponse
+	// is an alias for DeepgramError, which has no json:"type" tag, so a direct
+	// marshal emits {"Type":"Error",...} (capital T) and the frontend's
+	// `data.type === 'Error'` check never matches — the error is swallowed. Its
+	// code field is tagged json:"err_code" rather than json:"code", so the wire
+	// code is dropped on unmarshal and ErrCode is always empty; these Errors are
+	// connection-level in any case, which is what CONNECTION_FAILED means in the
+	// Flux error contract.
+	c.send(map[string]any{
+		"type":        "Error",
+		"description": er.Description,
+		"code":        "CONNECTION_FAILED",
+	})
 	return nil
 }
 func (c *fluxCallback) UnhandledEvent(byData []byte) error { return nil }
